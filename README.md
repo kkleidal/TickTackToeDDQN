@@ -9,3 +9,5 @@ python train.py
 will train the model and write logs to wandb. It trains by playing against various epsilon-greedy agents
 playing the optimal policy stochastically (both in terms of which of multiple possible optimal moves to play,
 and in terms of whether it makes the optimal move or a blunder -- the epsilon).
+
+[WandB example training curves](https://wandb.ai/kkleidal/tick-tack-toe/runs/n9oevv91?workspace=user-kkleidal)
