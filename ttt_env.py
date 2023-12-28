@@ -1,10 +1,11 @@
-from functools import cache
 import gzip
 import os
 import pickle
 import subprocess
-import numpy as np
+from functools import cache
 from typing import Optional, Tuple
+
+import numpy as np
 
 
 class Policy:

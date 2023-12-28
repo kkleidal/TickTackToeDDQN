@@ -1,7 +1,8 @@
-from functools import cache
-import numpy as np
-import pickle
 import gzip
+import pickle
+from functools import cache
+
+import numpy as np
 
 
 def three_in_a_row(m):

@@ -1,6 +1,8 @@
-from typing import List, Dict
-from ttt_env import MultiPolicy, OptimalPolicy, Policy, RandomPolicy, three_in_a_row
+from typing import Dict, List
+
 import numpy as np
+
+from ttt_env import MultiPolicy, OptimalPolicy, Policy, RandomPolicy, three_in_a_row
 
 
 def do_match(agent1, agent2):

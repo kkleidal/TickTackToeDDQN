@@ -1,60 +1,136 @@
+import copy
 import datetime
-from typing import Optional
+import os
+from contextlib import ExitStack
+from typing import Dict, Optional
+
 import numpy as np
 import torch
-import copy
 import tqdm
-import torch.nn.functional as F
-import os
-from utils import EMAMeter, maybe_to_cuda, random_of_max
-from replay_buffer import CircularBuffer
-from contextlib import ExitStack
-from ttt_env import (
-    Policy,
-    TickTackToeEnvironment,
-    MultiPolicy,
-    RandomPolicy,
-    OptimalPolicy,
-)
-from models import FFTickTackToeModel, TransformerTickTackToeModel
-from arena import AgentArena
+
 import wandb
+from arena import AgentArena
+from models import TransformerTickTackToeModel
+from replay_buffer import CircularBuffer
+from ttt_env import (
+    MultiPolicy,
+    OptimalPolicy,
+    Policy,
+    RandomPolicy,
+    TickTackToeEnvironment,
+)
+from utils import EMAMeter, maybe_to_cuda, random_of_max
 
 
-class DQNCallback:
-    def on_fit_start(self, trainer: "DQNTrainer"):
+class DDQNCallback:
+    """
+    This class represents a callback for the DDQNTrainer.
+
+    The callback methods are called at various points during training.
+    """
+
+    def on_fit_start(self, trainer: "DDQNTrainer"):
+        """
+        This method is called when the training starts.
+
+        Args:
+            trainer (DDQNTrainer): The trainer instance.
+        """
         ...
 
-    def on_episode_start(self, trainer: "DQNTrainer"):
+    def on_episode_start(self, trainer: "DDQNTrainer"):
+        """
+        This method is called when a new episode starts.
+
+        Args:
+            trainer (DDQNTrainer): The trainer instance.
+        """
         ...
 
     def on_training_update(
         self,
-        trainer: "DQNTrainer",
-        loss,
-        predicted_q_vals,
-        target_q_vals,
-        initial_states,
-        actions,
-        rewards,
-        next_states,
+        trainer: "DDQNTrainer",
+        loss: torch.Tensor,
+        predicted_q_vals: torch.Tensor,
+        target_q_vals: torch.Tensor,
+        initial_states: torch.Tensor,
+        actions: torch.Tensosr,
+        rewards: torch.Tensor,
+        next_states: list[torch.Tensor],
     ):
+        """
+        This method is called when the model is updated.
+
+        Args:
+            trainer (DDQNTrainer): The trainer instance.
+            loss (torch.Tensor): The unpooled loss tensor.
+            predicted_q_vals (torch.Tensor): The predicted q values.
+            target_q_vals (torch.Tensor): The target q values.
+            initial_states (torch.Tensor): The initial states.
+            actions (torch.Tensor): The actions.
+            rewards (torch.Tensor): The rewards.
+            next_states (list[torch.Tensor]): The next states.
+        """
         ...
 
-    def on_update_target(self, trainer: "DQNTrainer"):
+    def on_update_target(self, trainer: "DDQNTrainer"):
+        """
+        This method is called when the target model is updated with weights from the primary model.
+
+        Args:
+            trainer (DDQNTrainer): The trainer instance.
+        """
         ...
 
-    def on_episode_end(self, trainer: "DQNTrainer", episode_history):
+    def on_episode_end(self, trainer: "DDQNTrainer", episode_history: list):
+        """
+        This method is called when an episode ends.
+
+        Args:
+            trainer (DDQNTrainer): The trainer instance.
+            episode_history (list): The episode history containing tuples of events
+        """
         ...
 
-    def on_update_epsilon(self, trainer: "DQNTrainer", epsilon):
+    def on_update_epsilon(self, trainer: "DDQNTrainer", epsilon):
+        """
+        This method is called when the epsilon value is updated.
+
+        Args:
+            trainer (DDQNTrainer): The trainer instance.
+            epsilon (float): The new epsilon value.
+        """
         ...
 
-    def on_fit_end(self, trainer: "DQNTrainer"):
+    def on_fit_end(self, trainer: "DDQNTrainer"):
+        """
+        This method is called when the training ends.
+
+        Args:
+            trainer (DDQNTrainer): The trainer instance.
+        """
         ...
 
 
 class DDQNTrainer:
+    """
+    This class represents a trainer for the Double DQN algorithm.
+
+    Args:
+        env: The environment to train in.
+        model: The model to train.
+        opt: The optimizer to use for training.
+        logdir (str, optional): The directory to log training information. Defaults to None.
+        replay_buffer_len (int, optional): The length of the replay buffer. Defaults to 1_000_000.
+        max_training_steps (int, optional): The maximum number of training steps. Defaults to 200_000.
+        update_target_every (int, optional): The frequency of target updates. Defaults to 20_000.
+        gamma (float, optional): The discount factor. Defaults to 0.55.
+        learning_starts (int, optional): The number of steps before learning starts. Defaults to 10_000.
+        target_start (int, optional): The number of steps before target updates start. Defaults to 30_000.
+        batch_size (int, optional): The size of the training batch. Defaults to 128.
+        train_freq (int, optional): The frequency of training. Defaults to 4.
+    """
+
     def __init__(
         self,
         env,
@@ -74,7 +150,7 @@ class DDQNTrainer:
         exploration_fraction=0.1,
         exploration_final_eps=0.01,
         gradient_clipping=None,
-        callbacks: list[DQNCallback] = [],
+        callbacks: list[DDQNCallback] = [],
         logger=None,
     ):
         if logdir is None:
@@ -113,15 +189,19 @@ class DDQNTrainer:
         self.epsilon = None
         self.replay_buffer = None
 
-    def log_dict(self, d):
+    def log_dict(self, d: Dict[str, float]):
+        """Log a dictionary of values to the logger."""
         if self.logger:
             self.logger.log_dict(d, self.global_step)
 
-    def _event(self, event_name, *args, **kwargs):
+    def _event(self, event_name: str, *args, **kwargs):
+        """Call an event on all callbacks."""
         for callback in self.callbacks:
             getattr(callback, event_name)(self, *args, **kwargs)
 
     def fit(self):
+        """Fit the model."""
+
         self.global_step = 0
         self.last_train_update = 0
         self.last_exploration_update = 0
@@ -139,6 +219,7 @@ class DDQNTrainer:
         self._event("on_fit_end")
 
     def _take_action(self, board, epsilon, next_featurized, episode_history):
+        """Take an action in the environment during training."""
         valid_actions = self.env.get_valid_actions(board)
         featurized = next_featurized
         if np.random.rand() < epsilon:
@@ -167,6 +248,7 @@ class DDQNTrainer:
         return board, next_featurized, done
 
     def _maybe_train(self):
+        """Train the model a few updates if it is time."""
         if (
             self.global_step >= self.learning_starts
             and self.global_step - self.last_train_update >= self.train_freq
@@ -268,6 +350,7 @@ class DDQNTrainer:
                 self._event("on_update_target")
 
     def _train_episode(self):
+        """Train the model for a single episode."""
         self._event("on_episode_start")
         board = self.env.reset()
         next_featurized = self.model.featurize(board, self.env.my_player)
@@ -293,6 +376,8 @@ class DDQNTrainer:
 
 
 class ModelPolicy(Policy):
+    """A policy that uses a model to make greedy decisions."""
+
     def __init__(self, model):
         self.model = model
 
@@ -309,7 +394,13 @@ class ModelPolicy(Policy):
         return valid_moves[random_of_max(q_val[valid_moves])]
 
 
-class DQNAuditCallback(DQNCallback):
+class DQNAuditCallback(DDQNCallback):
+    """Writes game logs for a few games to a log file in the log directory.
+
+    Also logs game statistics for a games against a larger pool of agents
+    to the logger.
+    """
+
     def __init__(
         self,
         envs=None,
@@ -325,11 +416,11 @@ class DQNAuditCallback(DQNCallback):
         self.n_episodes = n_episodes
         self.arena = AgentArena.default()
 
-    def on_fit_start(self, trainer: "DQNTrainer"):
+    def on_fit_start(self, trainer: "DDQNTrainer"):
         super().on_fit_start(trainer)
         self.f = open(os.path.join(trainer.logdir, self.filename), "w")
 
-    def on_episode_end(self, trainer: "DQNTrainer", episode_history):
+    def on_episode_end(self, trainer: "DDQNTrainer", episode_history):
         super().on_episode_end(trainer, episode_history)
         envs = self.envs or [trainer.env]
         if trainer.global_step - self.last_audited >= self.audit_every:
@@ -365,12 +456,14 @@ class DQNAuditCallback(DQNCallback):
             self.f.write("\n")
             self.f.flush()
 
-    def on_fit_end(self, trainer: "DQNTrainer"):
+    def on_fit_end(self, trainer: "DDQNTrainer"):
         super().on_fit_end(trainer)
         self.f.close()
 
 
-class ProgBarLoggerCallback(DQNCallback):
+class ProgBarLoggerCallback(DDQNCallback):
+    """Logs training progress to a progress bar along with some metrics."""
+
     def __init__(self, update_postfix_every=100):
         self.progbar = None
         self.stack = ExitStack()
@@ -379,7 +472,7 @@ class ProgBarLoggerCallback(DQNCallback):
         self.update_postfix_every = update_postfix_every
         self.last_postfix_update = 0
 
-    def on_fit_start(self, trainer: "DQNTrainer"):
+    def on_fit_start(self, trainer: "DDQNTrainer"):
         super().on_fit_start(trainer)
         self.progbar = self.stack.enter_context(
             tqdm.tqdm(total=trainer.max_training_steps)
@@ -392,7 +485,7 @@ class ProgBarLoggerCallback(DQNCallback):
 
     def on_training_update(
         self,
-        trainer: "DQNTrainer",
+        trainer: "DDQNTrainer",
         loss,
         predicted_q_vals,
         target_q_vals,
@@ -416,11 +509,11 @@ class ProgBarLoggerCallback(DQNCallback):
         self.log("mean_train_target_q", target_q_vals.mean())
         self.log("mean_train_reward", rewards.mean())
 
-    def on_update_epsilon(self, trainer: "DQNTrainer", epsilon):
+    def on_update_epsilon(self, trainer: "DDQNTrainer", epsilon):
         return super().on_update_epsilon(trainer, epsilon)
         self.log("epsilon", epsilon)
 
-    def on_episode_end(self, trainer: "DQNTrainer", episode_history):
+    def on_episode_end(self, trainer: "DDQNTrainer", episode_history):
         super().on_episode_end(trainer, episode_history)
 
         rewards = []
@@ -441,12 +534,14 @@ class ProgBarLoggerCallback(DQNCallback):
             self.last_postfix_update = trainer.global_step
             self.progbar.set_postfix({k: v.value for k, v in self.emas.items()})
 
-    def on_fit_end(self, trainer: "DQNTrainer"):
+    def on_fit_end(self, trainer: "DDQNTrainer"):
         super().on_fit_end(trainer)
         self.stack.close()
 
 
 class WandBLogger:
+    """Logs training progress to wandb."""
+
     def __init__(self):
         wandb.init()
 
@@ -489,181 +584,6 @@ def train():
         logger=WandBLogger(),
     ).fit()
 
-    # model = maybe_to_cuda(model)
-    # target_model = maybe_to_cuda(target_model)
-
-    # opt = torch.optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-5)
-    # replay_buffer = CircularBuffer(replay_buffer_len)
-    # global_step = 0
-    # postfix = {
-    #     'loss': EMAMeter(0.95),
-    #     'valid_pct': EMAMeter(0.95),
-    #     'mean_rew': EMAMeter(0.95),
-    #     'mean_q': EMAMeter(0.95),
-    #     'eps': EMAMeter(0.95),
-    # }
-    # last_audited = 0
-    # last_target_update = 0
-    # with open('training.log', 'w') as f:
-    #     with tqdm.tqdm(total=max_training_steps) as pbar:
-    #         epsilon = exploration_initail_eps
-    #         my_player = np.random.randint(2)
-    #         while global_step < max_training_steps:
-    #             board, valid_actions = env.reset()
-    #             done = False
-    #             player = 0
-    #             pending = None
-    #             ep_valid_moves = []
-    #             ep_rewards = []
-    #             ep_loss = []
-    #             ep_epsilon = []
-    #             ep_q = []
-    #             ep_t = 0
-    #             while not done:
-    #                 featurized = featurize(board, player)
-    #                 if global_step % exploration_steps == 0:
-    #                     epsilon = exploration_final_eps + (exploration_initail_eps - exploration_final_eps) * np.exp(-global_step / max_training_steps)
-    #                 ep_epsilon.append(epsilon)
-    #                 assert len(valid_actions) > 0
-    #                 if player == my_player:
-    #                     if np.random.rand() < epsilon:
-    #                         action = valid_actions[np.random.randint(len(valid_actions))]
-    #                     else:
-    #                         model.eval()
-    #                         q_val = model(maybe_to_cuda(featurized).unsqueeze(0)).squeeze(0).cpu().detach().numpy()
-    #                         q_val_valid = q_val[valid_actions]
-    #                         # check_soft_divergence(q_val_valid, gamma)
-    #                         action = valid_actions[random_of_max(q_val_valid)]
-    #                         ep_q.append(q_val[action].item())
-    #                 else:
-    #                     action = oracle(board, player)
-    #                 board, rewards, done, was_valid, valid_actions = env.step(action)
-    #                 #next_featurized = featurize(board, player)
-    #                 player = (player + 1) % 2
-    #                 if player == my_player:
-    #                     ep_valid_moves.append(was_valid)
-    #                     for rew in rewards:
-    #                         if rew is not None:
-    #                             ep_rewards.append(rew)
-    #                 my_reward, their_reward = rewards
-    #                 # gamma = player_t_to_gamma[ep_t // 2]
-    #                 ep_t += 1
-    #                 if pending is not None:
-    #                     # Update reward for other player if they lost
-    #                     pending_state, pending_action, pending_reward = pending
-    #                     next_featurized = None if done else featurize(board, player)
-    #                     replay_buffer.append((pending_state, pending_action, their_reward if done else pending_reward, next_featurized, False))
-    #                 pending = (featurized, action, my_reward)
-    #                 if done and pending:
-    #                     # Finished episode; flush pending immediately
-    #                     pending_state, pending_action, pending_reward = pending
-    #                     replay_buffer.append((pending_state, pending_action, pending_reward, None, True))
-    #                     pending = None
-    #                 if global_step >= learning_starts and global_step % train_freq == 0:
-    #                     for gradient_step in range(gradient_steps):
-    #                         batch = replay_buffer.sample(batch_size)
-    #                         initial_states = maybe_to_cuda(torch.stack([maybe_to_cuda(s) for s, _, _, _, _ in batch]))
-    #                         actions = maybe_to_cuda(torch.from_numpy(np.array([a for _, a, _, _, _ in batch], dtype=np.int64)))
-    #                         rewards = maybe_to_cuda(torch.from_numpy(np.array([r for _, _, r, _, _ in batch], dtype=np.float32)))
-    #                         is_done = maybe_to_cuda(torch.from_numpy(np.array([1.0 if d else 0.0 for _, _, _, _, d in batch], dtype=np.float32)))
-    #                         # gammas = maybe_to_cuda(torch.from_numpy(np.array([g for _, _, _, _, g in batch], dtype=np.float32)))
-
-    #                         model.train()
-    #                         target_model.eval()
-    #                         predicted_q_vals = model(initial_states).gather(1, actions.unsqueeze(1)).squeeze(1)
-    #                         target_q_vals = rewards
-    #                         if target_initialized:
-    #                             all_next_states = [s for _, _, _, s, _ in batch]
-    #                             idc = maybe_to_cuda(torch.tensor([i for i, s in enumerate(all_next_states) if s is not None]))
-    #                             if any(s is not None for s in all_next_states):
-    #                                 next_states = maybe_to_cuda(torch.stack([maybe_to_cuda(s) for s in all_next_states if s is not None]))
-    #                                 target_q_vals[idc] += gamma * target_model(next_states).max(dim=1)[0].detach()
-    #                         # target_q_vals = torch.clamp(target_q_vals, clip_target_q_min, clip_target_q_max)
-    #                         loss = torch.square(predicted_q_vals - target_q_vals).clamp(0, 1).mean()
-
-    #                         loss.backward()
-    #                         opt.step()
-
-    #                     if global_step >= target_start and global_step - last_target_update >= update_target_every:
-    #                         print("Update target")
-    #                         last_target_update = global_step
-    #                         target_model.load_state_dict(copy.deepcopy(model.state_dict()))
-    #                         target_initialized = True
-
-    #                     ep_loss.append(loss.item())
-    #                     pbar.update(1)
-    #                 else:
-    #                     pbar.update(1)
-
-    #                 global_step += 1
-
-    #             if global_step - last_audited >= 10_000:
-    #                 print("Audit")
-    #                 last_audited = global_step
-    #                 f.write(f'AUDIT {global_step}\n')
-    #                 for _ in range(10):
-    #                     f.write(f'new epsiode\n')
-    #                     my_player = np.random.randint(2)
-    #                     f.write(f'my_player: {my_player}\n')
-    #                     board, valid_actions = env.reset()
-    #                     player = 0
-    #                     model.eval()
-    #                     target_model.eval()
-    #                     pending = None
-    #                     done = False
-    #                     ep_t = 0
-    #                     while not done:
-    #                         featurized = featurize(board, player)
-    #                         if player == my_player:
-    #                             q_val = model(maybe_to_cuda(featurized).unsqueeze(0)).squeeze(0).cpu().detach().numpy()
-    #                             q_val_valid = q_val[valid_actions]
-    #                             action = valid_actions[random_of_max(q_val_valid)]
-    #                         else:
-    #                             action = oracle(board, player)
-    #                         board, rewards, done, was_valid, valid_actions = env.step(action)
-    #                         next_featurized = featurize(board, player)
-    #                         # gamma = player_t_to_gamma[ep_t // 2]
-    #                         ep_t += 1
-
-    #                         def flush_pending(include_extra=0):
-    #                             if pending:
-    #                                 pending_q, pending_action, pending_reward, pending_next, gamma = pending
-    #                                 if include_extra:
-    #                                     pending_reward = include_extra
-    #                                 target_q_next= target_model(maybe_to_cuda(pending_next.unsqueeze(0))).detach().cpu()
-    #                                 target_q_val = pending_reward + gamma * target_q_next.max(dim=1)[0]
-    #                                 f.write(f'action:{pending_action}, reward:{pending_reward}, q_val:{pending_q.tolist()}, target_q_val:{target_q_val}\n')
-    #                         if pending is not None:
-    #                             # Update reward for other player if they lost
-    #                             flush_pending(rewards[1] or 0)
-    #                         pending = (q_val, action, rewards[0], next_featurized, gamma) if player == my_player else None
-    #                         if done:
-    #                             flush_pending()
-    #                         if player != my_player:
-    #                             f.write(f'oracle action:{action}\n')
-    #                         player = (player + 1) % 2
-    #                 f.write('\n')
-    #                 f.flush()
-
-    #             postfix['mean_rew'].update(np.mean(ep_rewards))
-    #             if ep_q:
-    #                 postfix['mean_q'].update(np.mean(ep_q))
-    #             postfix['valid_pct'].update(np.mean([1.0 if valid else 0.0 for valid in ep_valid_moves]))
-    #             postfix['eps'].update(np.mean(ep_epsilon))
-    #             if ep_loss:
-    #                 postfix['loss'].update(np.mean(ep_loss))
-    #             if global_step % 1000 == 0:
-    #                 pbar.set_postfix({k: v.value for k, v in postfix.items()})
-
 
 if __name__ == "__main__":
     train()
-    # env = TickTackToeEnvironment()
-    # board = env.reset()
-    # env.render()
-    # env.step(4)
-    # env.render()
-    # env.step(0)
-    # env.render()
-    # env.step(6)
-    # env.render()
